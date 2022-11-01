@@ -24,7 +24,7 @@ from numpy import (
 from numpy.linalg import norm as npnorm, inv
 from spatialmath import SE3, SE2
 from spatialgeometry import Cylinder
-from spatialmath.base.argcheck import getvector, islistof
+from spatialmath.base.argcheck import getvector, islistof,getmatrix
 from roboticstoolbox.robot.Link import Link, Link2, BaseLink
 from roboticstoolbox.robot.ETS import ETS, ETS2
 from roboticstoolbox.robot.ET import ET
@@ -2041,88 +2041,88 @@ class ERobot(BaseERobot):
         return Ain, bin
 
     # inverse dynamics (recursive Newton-Euler) using spatial vector notation
-    def rne(self, q, qd, qdd, symbolic=False, gravity=None):
-
+    def rne(self, Q, QD, QDD, symbolic=False, gravity=None):
         n = self.n
-
         # allocate intermediate variables
         Xup = SE3.Alloc(n)
         Xtree = SE3.Alloc(n)
-
         v = SpatialVelocity.Alloc(n)
         a = SpatialAcceleration.Alloc(n)
         f = SpatialForce.Alloc(n)
         I = SpatialInertia.Alloc(n)  # noqa
         s = []  # joint motion subspace
-
+        if Q is not None and QD is None and QDD is None:
+            # single argument case
+            Q = getmatrix(Q, (None, self.n * 3))
+            q = Q[:, 0:n]
+            qd = Q[:, n : 2 * n]
+            qdd = Q[:, 2 * n :]
+        else:
+            # 3 argument case
+            q = getmatrix(Q, (None, self.n))
+            qd = getmatrix(QD, (None, self.n))
+            qdd = getmatrix(QDD, (None, self.n))
+        nk=q.shape[0]
         if symbolic:
-            Q = empty((n,), dtype="O")  # joint torque/force
+            tau = zeros((nk, n), dtype="O")
         else:
-            Q = empty((n,))  # joint torque/force
-
-        # TODO Should the dynamic parameters of static links preceding joint be
-        # somehow merged with the joint?
-
-        # A temp variable to handle static joints
-        Ts = SE3()
-
-        # A counter through joints
-        j = 0
-
-        # initialize intermediate variables
-        for link in self.links:
-            if link.isjoint:
-                I[j] = SpatialInertia(m=link.m, r=link.r)
-                if symbolic and link.Ts is None:
-                    Xtree[j] = SE3(eye(4, dtype="O"), check=False)
+            tau = zeros((nk, n))
+        for k in range(nk):
+            q_k = q[k, :]
+            qd_k = qd[k, :]
+            qdd_k = qdd[k, :]
+            j = 0
+            Ts = SE3(eye(4, dtype="O"), check=False)
+            if gravity is None:
+                a_grav = SpatialAcceleration(self.gravity)
+            else:
+                a_grav = -SpatialAcceleration(gravity)
+            # print(a_grav)
+            for link in self.links:
+                if link.isjoint:
+                    I[j] = SpatialInertia(m=link.m, r=link.r,I=link.I)
+                    # print(link.I)
+                    if symbolic and link.Ts is None:
+                        Xtree[j] = SE3(eye(4, dtype="O"), check=False)
+                    else:
+                        Xtree[j] = Ts * SE3(link.A(q_k[j]), check=False)
+                    if link.v is not None:
+                        s.append((link.v.s))
+                    j += 1
+                    Ts = SE3(eye(4, dtype="O"), check=False)
                 else:
-                    Xtree[j] = Ts * SE3(link.Ts, check=False)
-
-                if link.v is not None:
-                    s.append(link.v.s)
-
-                # Increment the joint counter
-                j += 1
-
-                # Reset the Ts tracker
-                Ts = SE3()
-            else:
-                # TODO Keep track of inertia and transform???
-                Ts *= SE3(link.Ts, check=False)
-
-        if gravity is None:
-            a_grav = -SpatialAcceleration(self.gravity)
+                    Ts *= SE3(link.Ts, check=False)
+            j = 0
+            for link in self.links:
+                if link.isjoint:
+                    vJ = SpatialVelocity(s[j] * qd_k[j])
+                    # transform from  j's parent to j
+                    Xup[j] = Xtree[j].inv()
+                    jointParent = link.parent
+                    if jointParent.jindex is None:
+                        v[j] = vJ
+                        a[j] = Xup[j] * a_grav + SpatialAcceleration(s[j] * qdd_k[j])
+                    else:
+                        jp = jointParent.jindex
+                        v[j] = Xup[j] * v[jp] + vJ
+                        a[j] = Xup[j] * a[jp] + SpatialAcceleration(s[j] * qdd_k[j]) + v[j] @ vJ
+                    f[j] = I[j] * a[j] + v[j] @ (I[j] * v[j])
+                    # Increment the joint counter
+                    j += 1
+            j = n-1
+            # print("before f:\n",f)
+            for link in reversed(self.links):
+                if link.isjoint:
+                    tau[k, j]= sum(s[j]*f[j])
+                    jp = link.parent.jindex
+                    if jp is not None:                        
+                        f[jp] = f[jp] +Xup[j]*f[j]
+                    j -= 1
+                    
+        if tau.shape[0] == 1:
+            return tau.flatten()
         else:
-            a_grav = -SpatialAcceleration(gravity)
-
-        # forward recursion
-        for j in range(0, n):
-            vJ = SpatialVelocity(s[j] * qd[j])
-
-            # transform from parent(j) to j
-            Xup[j] = SE3(self.links[j].A(q[j])).inv()
-
-            if self.links[j].parent is None:
-                v[j] = vJ
-                a[j] = Xup[j] * a_grav + SpatialAcceleration(s[j] * qdd[j])
-            else:
-                jp = self.links[j].parent.jindex  # type: ignore
-                v[j] = Xup[j] * v[jp] + vJ
-                a[j] = Xup[j] * a[jp] + SpatialAcceleration(s[j] * qdd[j]) + v[j] @ vJ
-
-            f[j] = I[j] * a[j] + v[j] @ (I[j] * v[j])
-
-        # backward recursion
-        for j in reversed(range(0, n)):
-
-            # next line could be dot(), but fails for symbolic arguments
-            Q[j] = sum(f[j].A * s[j])
-
-            if self.links[j].parent is not None:
-                jp = self.links[j].parent.jindex  # type: ignore
-                f[jp] = f[jp] + Xup[j] * f[j]
-
-        return Q
+            return tau 
 
     # --------------------------------------------------------------------- #
 
